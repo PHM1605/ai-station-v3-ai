@@ -191,12 +191,15 @@ def train_job(job_id):
   )
   
   if job is None:
-    existing_job = jobs.find_one({"job_id": job_id})
-    if existing_job and existing_job["status"] in ["completed", "failed", "cancelled", "deleting"]:
+    existing_job = jobs.find_one({"job_id": job_id}, {"status": 1})
+    if existing_job is None:
+      logging.warning("Skipping deleted job %s", job_id)
+      return 
+    if existing_job["status"] in ["completed", "failed", "cancelled", "deleting"]:
       logging.info("Skipping finished job %s", job_id)
       return # => ACK in "finish_delivery"
     # if job not exist => error (to be catched in "finish_delivery") => NACK
-    raise RuntimeError("Job is missing, not ready, or already running")
+    raise RuntimeError(f"Job {job_id} cannot be claimed; status={existing_job['status']}")
     
   # Update MongoDB from "cancel_requested" to "cancelled" Job
   # will be call once BEFORE and once AFTER "model.train()" to check status
