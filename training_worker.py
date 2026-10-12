@@ -48,29 +48,14 @@ def polygon_to_label(polygon):
   return "0 " + " ".join(coordinates)
   
 def split_samples(samples):
+  shuffled = list(samples)
   random_generator = random.Random(42)
-  video_ids = sorted({sample["video_id"] for sample in samples})
-  if len(video_ids) >= 2:
-    # Keep frames from same video in the same split
-    random_generator.shuffle(video_ids)
-    validation_count = max(1, round(len(video_ids)*0.2))
-    validation_videos = set(video_ids[:validation_count])
-    train_samples = [
-      sample for sample in samples
-      if sample["video_id"] not in validation_videos
-    ]
-    validation_samples = [
-      sample for sample in samples
-      if sample["video_id"] in validation_videos
-    ]
-  else:
-    logging.warning("Only 1 video: using a frame split. Similar frames can make a validation score optimistic.")
-    shuffled = list(samples)
-    random_generator.shuffle(shuffled)
-    
-    validation_count = max(1, round(len(shuffled) * 0.2))
-    validation_samples = shuffled[:validation_count]
-    train_samples = shuffled[validation_count:]
+  random_generator.shuffle(shuffled)
+  
+  validation_count = max(1, round(len(shuffled) * 0.2))
+  validation_samples = shuffled[:validation_count]
+  train_samples = shuffled[validation_count:]
+  
   return train_samples, validation_samples
 
 # Download from Go Server to GPU Server
