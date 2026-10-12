@@ -1,0 +1,10 @@
+dotenv
+uvicorn
+pydantic
+pymongo
+pika
+python-dotenv
+torch
+torchvision
+ultralytics
+pyyaml
