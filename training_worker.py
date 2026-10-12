@@ -6,13 +6,16 @@ from functools import partial # library to create a Callback
 from pathlib import Path
 from pymongo import MongoClient, ReturnDocument
 from ultralytics import YOLO
+from urllib.request import Request, urlopen
 
 AI_DIRECTORY = Path(__file__).resolve().parent
-SERVER_DIRECTORY = AI_DIRECTORY.parent / "server"
+# SERVER_DIRECTORY = AI_DIRECTORY.parent / "server"
 TRAINING_DIRECTORY = AI_DIRECTORY / "training_runs"
 QUEUE_NAME = "ai_station.training"
 
 load_dotenv(AI_DIRECTORY / ".env")
+BACKEND_API_URL = os.environ["BACKEND_API_URL"].rstrip("/")
+WORKER_API_TOKEN = os.environ["WORKER_API_TOKEN"]
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -70,6 +73,30 @@ def split_samples(samples):
     train_samples = shuffled[validation_count:]
   return train_samples, validation_samples
 
+# Download from Go Server to GPU Server
+def download_snapshot(job_id, frame_id, destination):
+  url = f"{BACKEND_API_URL}/internal/training-jobs/{job_id}/frames/{frame_id}/image"
+  request = Request(url, headers={"X-Worker-Token": WORKER_API_TOKEN})
+  # Get Snapshot Image from Go Server
+  with urlopen(request, timeout=120) as response:
+    with destination.open("wb") as image_file:
+      shutil.copyfileobj(response, image_file)
+
+# Upload trained model from GPU Server to Go Server
+def upload_model(job_id, best_model):
+  url = f"{BACKEND_API_URL}/internal/training-jobs/{job_id}/model" # Go URL
+  request = Request(
+    url,
+    data=best_model.read_bytes(),
+    headers={
+      "X-Worker-Token": WORKER_API_TOKEN,
+      "Content-Type": "application/octet-stream",
+    },
+    method="PUT"
+  )
+  with urlopen(request, timeout=300) as response:
+    return json.load(response)["model_path"] # Go Server path of Model (stored in MongoDB)
+
 def prepare_dataset(job):
   # struct of "job": in training_controller
   samples = list(snapshots.find({
@@ -85,7 +112,7 @@ def prepare_dataset(job):
   
   dataset_directory = job_directory / "dataset" # AI/training_runs/<job_id>/dataset
   train_samples, validation_samples = split_samples(samples)
-  uploads_directory = (SERVER_DIRECTORY / "uploads").resolve() # server/uploads
+  # uploads_directory = (SERVER_DIRECTORY / "uploads").resolve() # server/uploads
   
   for split, selected_samples in [("train", train_samples),("val", validation_samples)]:
     images_directory = dataset_directory / "images" / split # AI/training_runs/<job_id>/dataset/images/train (or /val)
@@ -97,15 +124,26 @@ def prepare_dataset(job):
     # sample: 1 frame and its polygons
     # prepare "images/train (or val)/*.jpg" and "labels/train (or val)/*.txt"
     for sample in selected_samples:
-      source_image = (SERVER_DIRECTORY / sample["snapshot_path"]).resolve() # server/uploads/training/<jobId>/images/xxx.jpg
-      if not source_image.is_relative_to(uploads_directory):
-        raise ValueError("Snapshot image is outside uploads")
-      if not source_image.is_file():
-        raise FileNotFoundError(f"Missing snapshot for frame {sample['frame_id']}")
+      # For LOCAL AI server
+      # source_image = (SERVER_DIRECTORY / sample["snapshot_path"]).resolve() # server/uploads/training/<jobId>/images/xxx.jpg
+      # if not source_image.is_relative_to(uploads_directory):
+      #   raise ValueError("Snapshot image is outside uploads")
+      # if not source_image.is_file():
+      #   raise FileNotFoundError(f"Missing snapshot for frame {sample['frame_id']}")
+      # frame_id = sample["frame_id"]
+      # image_name = frame_id + source_image.suffix.lower()
+      # # copy from Snapshot directory to "train"/"val" directory
+      # shutil.copy2(source_image, images_directory / image_name)
+      
+      # For REMOTE GPU AI Server
       frame_id = sample["frame_id"]
-      image_name = frame_id + source_image.suffix.lower()
-      # copy from Snapshot directory to "train"/"val" directory
-      shutil.copy2(source_image, images_directory / image_name)
+      image_name = f"{frame_id}.jpg"
+      download_snapshot(
+        job["job_id"],
+        frame_id,
+        images_directory / image_name
+      )
+      
       # create lines of polygons => write to a <frame_id>.txt file
       label_lines = [
         polygon_to_label(polygon)
@@ -242,12 +280,15 @@ def train_job(job_id):
     best_model = Path(model.trainer.best).resolve()
     if not best_model.is_file():
       raise RuntimeError("Training did not produce best.pt")
+    
+    # model_path = str(best_model) # for local AI server
+    model_path = upload_model(job_id, best_model) # for separate GPU AI Server
     # update job status in DB
     result = jobs.update_one(
       {"job_id": job_id, "status": "running"},
       {"$set": {
         "status": "completed",
-        "model_path": str(best_model),
+        "model_path": model_path,
         "completed_at": utc_now(),
         "updated_at": utc_now(),
       }}
@@ -278,6 +319,13 @@ def train_job(job_id):
         }
       }
     )
+  finally:
+    try:
+      final_job = jobs.find_one({"job_id": job_id}, {"status": 1})
+      if final_job and final_job["status"] in ("completed", "failed", "cancelled"):
+        shutil.rmtree(TRAINING_DIRECTORY / job_id, ignore_errors=True)
+    except Exception:
+      logging.exception("Could not clean remote files for job %s", job_id)
     
 # future is "Task Outcome"
 def finish_delivery(channel, delivery_tag, future):
