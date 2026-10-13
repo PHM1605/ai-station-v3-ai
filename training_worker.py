@@ -81,6 +81,41 @@ def upload_model(job_id, best_model):
   )
   with urlopen(request, timeout=300) as response:
     return json.load(response)["model_path"] # Go Server path of Model (stored in MongoDB)
+    
+def upload_prediction(job_id, frame_id, image_path):
+  url = f"{BACKEND_API_URL}/internal/training-jobs/{job_id}/predictions/{frame_id}"
+  request = Request(
+    url,
+    data=image_path.read_bytes(),
+    headers={
+      "X-Worker-Token": WORKER_API_TOKEN,
+      "Content-Type": "image/jpeg",
+    },
+    method="PUT",
+  )
+  with urlopen(request, timeout=120) as response:
+    if response.status != 204:
+      raise RuntimeError(f"Prediction upload returned status {response.status}")
+
+# job_directory: AI/training_runs/<job_id>
+def generate_predictions(job_id, best_model, job_directory):
+  validation_directory = job_directory / "dataset" / "images" / "val"
+  preview_directory = job_directory / "previews"
+  preview_directory.mkdir()
+  
+  predictor = YOLO(str(best_model))
+  # Display at most 12 validation images
+  for image_path in sorted(validation_directory.glob("*.jpg"))[:12]:
+    preview_path = preview_directory / image_path.name
+    result = predictor.predict(
+      source=str(image_path),
+      imgsz=640,
+      conf=0.25,
+      device=os.getenv("TRAIN_DEVICE", "cpu"),
+      verbose=False,
+    )[0]
+    result.save(filename=str(preview_path), boxes=False) # boxes=False mean "draw Segmentation only, no draw box" (NOTE: box is from segmentation boundaries)
+    upload_prediction(job_id, image_path.stem, preview_path) # image_path.stem: is "frame_id" (raw name of image)
 
 def prepare_dataset(job):
   # struct of "job": in training_controller
@@ -271,6 +306,13 @@ def train_job(job_id):
     
     # model_path = str(best_model) # for local AI server
     model_path = upload_model(job_id, best_model) # for separate GPU AI Server
+    
+    # Predict on Validation set
+    try:
+      generate_predictions(job_id, best_model, job_directory)
+    except Exception:
+      logging.exception("Could not generate prediction previews for job %s", job_id)
+    
     # update job status in DB
     result = jobs.update_one(
       {"job_id": job_id, "status": "running"},
